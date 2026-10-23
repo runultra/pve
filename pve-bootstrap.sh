@@ -48,7 +48,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -78,32 +78,149 @@ DRY_RUN=0
 DO_REPOS=1 DO_NAG=1 DO_UPGRADE=1 DO_HA=1 DO_NETWORK=1 DO_CLUSTER=1 DO_STORAGE=1
 
 # -----------------------------------------------------------------------------
-# output helpers
+# UI: colors, symbols, stage headers, spinner, summary
+#   Fancy output only on a UTF-8 terminal; plain ASCII when piped/logged.
 # -----------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-  C_R=$'\e[31m' C_G=$'\e[32m' C_Y=$'\e[33m' C_B=$'\e[36m' C_0=$'\e[0m' C_BOLD=$'\e[1m'
+IS_TTY=0; [[ -t 1 ]] && IS_TTY=1
+UTF=0; [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" =~ [Uu][Tt][Ff]-?8 ]] && UTF=1
+if (( IS_TTY )); then
+  C_R=$'\e[38;5;203m' C_G=$'\e[38;5;114m' C_Y=$'\e[38;5;221m' C_B=$'\e[38;5;81m'
+  C_M=$'\e[38;5;208m' C_D=$'\e[38;5;245m' C_W=$'\e[1;97m' C_0=$'\e[0m' C_BOLD=$'\e[1m'
 else
-  C_R='' C_G='' C_Y='' C_B='' C_0='' C_BOLD=''
+  C_R='' C_G='' C_Y='' C_B='' C_M='' C_D='' C_W='' C_0='' C_BOLD=''
 fi
-info()  { printf '%s[..]%s %s\n' "$C_B" "$C_0" "$*"; }
-ok()    { printf '%s[ok]%s %s\n' "$C_G" "$C_0" "$*"; }
-warn()  { printf '%s[!!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
-err()   { printf '%s[xx]%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+if (( UTF && IS_TTY )); then
+  S_OK='✔' S_WARN='▲' S_ERR='✖' S_INFO='›' S_Q='?' S_SKIP='–' S_RULE='━' S_BAR='┃' S_TOP='┏' S_BOT='┗'
+  SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+else
+  S_OK='ok' S_WARN='!!' S_ERR='xx' S_INFO='..' S_Q='?' S_SKIP='--' S_RULE='=' S_BAR='|' S_TOP='+' S_BOT='+'
+  SPIN=('-' '\' '|' '/')
+fi
+COLS="$(tput cols 2>/dev/null || echo 80)"; [[ $COLS =~ ^[0-9]+$ ]] || COLS=80; (( COLS > 100 )) && COLS=100
+
+info()  { printf '  %s%s%s %s\n' "$C_B" "$S_INFO" "$C_0" "$*"; }
+ok()    { printf '  %s%s%s %s\n' "$C_G" "$S_OK" "$C_0" "$*"; }
+warn()  { printf '  %s%s%s %s\n' "$C_Y" "$S_WARN" "$C_0" "$*" >&2; }
+err()   { printf '  %s%s%s %s\n' "$C_R" "$S_ERR" "$C_0" "$*" >&2; }
 die()   { err "$*"; exit 1; }
-hdr()   { printf '\n%s== %s ==%s\n' "$C_BOLD" "$*" "$C_0"; }
+hdr()   { printf '\n  %s%s%s %s%s%s\n' "$C_M" "$S_INFO$S_INFO" "$C_0" "$C_BOLD" "$*" "$C_0"; }
+rule()  { local n="$1" out=""; while (( n-- > 0 )); do out+="$S_RULE"; done; printf '%s' "$out"; }
+
+STAGE_N=0 STAGE_TOTAL=0
+stage() { # numbered, full-width stage header
+  STAGE_N=$((STAGE_N + 1))
+  local label=" [${STAGE_N}/${STAGE_TOTAL}] $* "
+  local fill=$(( COLS - ${#label} - 6 )); (( fill < 3 )) && fill=3
+  printf '\n%s%s%s%s%s%s%s\n' "$C_M" "$(rule 3)" "$C_W" "$label" "$C_M" "$(rule "$fill")" "$C_0"
+}
+
+LOG="/root/pve-bootstrap.log"
+spin() { # spin "label" cmd args...  : run quietly with a spinner + timer, log output
+  local label="$1"; shift
+  local t0=$SECONDS rc=0
+  printf '\n===== %s: %s\n' "$(date '+%F %T')" "$label" >>"$LOG"
+  if (( ! IS_TTY )); then
+    info "$label"
+    "$@" >>"$LOG" 2>&1 || rc=$?
+  else
+    "$@" >>"$LOG" 2>&1 &
+    local pid=$! i=0
+    printf '\e[?25l'
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r  %s%s%s %s %s%ds%s ' "$C_B" "${SPIN[i++ % ${#SPIN[@]}]}" "$C_0" "$label" "$C_D" $((SECONDS - t0)) "$C_0"
+      sleep 0.12
+    done
+    wait "$pid" || rc=$?
+    printf '\e[?25h'
+    printf '\r\e[K'
+  fi
+  if (( rc == 0 )); then
+    ok "$label ${C_D}($(dur $((SECONDS - t0))))${C_0}"
+  else
+    err "$label failed (exit $rc). Last lines of $LOG:"
+    tail -n 12 "$LOG" | sed 's/^/      /' >&2
+  fi
+  return $rc
+}
+
+dur() { local s="$1"; (( s >= 60 )) && printf '%dm%02ds' $((s / 60)) $((s % 60)) || printf '%ds' "$s"; }
+
+SUMMARY=()
+summ() { # summ ok|warn|skip|err "Stage" "detail"
+  local sym col
+  case "$1" in
+    ok)   sym="$S_OK"   col="$C_G" ;;
+    warn) sym="$S_WARN" col="$C_Y" ;;
+    err)  sym="$S_ERR"  col="$C_R" ;;
+    *)    sym="$S_SKIP" col="$C_D" ;;
+  esac
+  SUMMARY+=("$(printf '%s%s%s %s%-9s%s %s' "$col" "$sym" "$C_0" "$C_BOLD" "$2" "$C_0" "$3")")
+}
+
+print_summary() {
+  local line title=" Summary "
+  printf '\n  %s%s%s%s%s%s%s\n' "$C_M" "$S_TOP$(rule 2)" "$C_W" "$title" "$C_M" "$(rule $((COLS - ${#title} - 8)))" "$C_0"
+  for line in "${SUMMARY[@]}"; do printf '  %s%s%s %s\n' "$C_M" "$S_BAR" "$C_0" "$line"; done
+  printf '  %s%s%s %s%s%s\n' "$C_M" "$S_BOT$(rule 2)" "$C_0" "$C_D" "$1" "$C_0"
+}
+
+banner() {
+  local mode="interactive"
+  (( ASSUME_YES )) && mode="unattended (-y)"
+  (( DRY_RUN )) && mode="${C_Y}DRY RUN${C_0}${C_D}: nothing will be changed"
+  local -a side=(
+    "${C_W}bootstrap${C_0} ${C_D}v${VERSION}${C_0}"
+    "${C_D}host   ${C_0} $(hostname)"
+    "${C_D}pve    ${C_0} $(pveversion 2>/dev/null | grep -oE 'pve-manager/[0-9.]+' | cut -d/ -f2 || echo '?')"
+    "${C_D}kernel ${C_0} $(uname -r)"
+    "${C_D}mode   ${C_0} ${mode}"
+    "${C_D}log    ${C_0} ${LOG}"
+  )
+  echo
+  if (( UTF && IS_TTY )); then
+    local -a art=(
+      '██████╗ ██╗   ██╗███████╗'
+      '██╔══██╗██║   ██║██╔════╝'
+      '██████╔╝██║   ██║█████╗  '
+      '██╔═══╝ ╚██╗ ██╔╝██╔══╝  '
+      '██║      ╚████╔╝ ███████╗'
+      '╚═╝       ╚═══╝  ╚══════╝'
+    )
+    local -a grad=(202 202 208 208 214 214) i
+    for i in 0 1 2 3 4 5; do
+      printf '  \e[38;5;%sm%s%s    %s\n' "${grad[i]}" "${art[i]}" "$C_0" "${side[i]}"
+    done
+  else
+    printf '  %spve-bootstrap %s%s\n' "$C_BOLD" "$VERSION" "$C_0"
+    for i in "${side[@]:1}"; do printf '  %s\n' "$i"; done
+  fi
+}
+
+colordiff() { # colorize unified diff on stdin
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      ---*|+++*) printf '    %s%s%s\n' "$C_D" "$l" "$C_0" ;;
+      @@*)       printf '    %s%s%s\n' "$C_B" "$l" "$C_0" ;;
+      +*)        printf '    %s%s%s\n' "$C_G" "$l" "$C_0" ;;
+      -*)        printf '    %s%s%s\n' "$C_R" "$l" "$C_0" ;;
+      *)         printf '    %s%s%s\n' "$C_D" "$l" "$C_0" ;;
+    esac
+  done
+}
 
 # All prompts read from /dev/tty so this works under `bash -c "$(curl ...)"`.
 ask() { # ask "Prompt" "default" -> echoes answer
   local prompt="$1" def="${2-}" ans
   if (( ASSUME_YES )); then printf '%s\n' "$def"; return; fi
-  read -r -p "$prompt [${def}]: " ans </dev/tty || true
+  read -r -p "  ${C_B}${S_Q}${C_0} ${prompt} ${C_D}[${def}]${C_0} " ans </dev/tty || true
   printf '%s\n' "${ans:-$def}"
 }
 confirm() { # confirm "Prompt" y|n
   local prompt="$1" def="${2:-n}" ans hint
   [[ $def == y ]] && hint="Y/n" || hint="y/N"
   if (( ASSUME_YES )); then [[ $def == y ]]; return; fi
-  read -r -p "$prompt [$hint]: " ans </dev/tty || true
+  read -r -p "  ${C_B}${S_Q}${C_0} ${prompt} ${C_D}(${hint})${C_0} " ans </dev/tty || true
   ans="${ans:-$def}"
   [[ ${ans,,} == y || ${ans,,} == yes ]]
 }
@@ -132,7 +249,7 @@ preflight() {
   CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
   [[ -f /etc/pve/corosync.conf ]] && CLUSTERED=1
   (( PVE_MAJOR >= 8 )) || die "PVE ${v} not supported (need 8.x or 9.x)."
-  info "Host $(hostname)  PVE ${v}  Debian ${CODENAME}  clustered=${CLUSTERED}  kernel $(uname -r)"
+  (( CLUSTERED )) && info "Debian ${CODENAME}, already in a cluster" || info "Debian ${CODENAME}, standalone"
   if [[ -n ${SSH_CONNECTION:-} && -z ${TMUX:-}${STY:-} ]]; then
     warn "Running over SSH without tmux/screen. The network stage has an auto-rollback,"
     warn "but tmux is safer: apt install tmux && tmux new -s bootstrap"
@@ -193,7 +310,7 @@ ceph_release() { # derive ceph-<name> from existing repo files, else from PVE mi
 }
 
 setup_repos() {
-  hdr "APT repositories"
+  stage "APT repositories"
   disable_enterprise_repos
 
   if has_repo_component pve-no-subscription; then
@@ -234,13 +351,14 @@ EOF
       >/etc/apt/sources.list.d/ceph.list
     ok "Ceph repo set to ${cr} no-subscription"
   fi
+  summ ok "Repos" "enterprise off, pve + ${cr} no-subscription on"
 }
 
 # -----------------------------------------------------------------------------
 # 2. subscription nag
 # -----------------------------------------------------------------------------
 remove_nag() {
-  hdr "Subscription nag"
+  stage "Subscription nag"
   cat >/usr/local/bin/pve-remove-nag.sh <<'EOF'
 #!/bin/sh
 # Installed by pve-bootstrap.sh; re-applied after every dpkg run.
@@ -253,6 +371,7 @@ EOF
   echo 'DPkg::Post-Invoke { "/usr/local/bin/pve-remove-nag.sh"; };' >/etc/apt/apt.conf.d/no-nag-script
   /usr/local/bin/pve-remove-nag.sh
   ok "Nag removed (hard-refresh the browser). Hook re-applies it after updates."
+  summ ok "Nag" "subscription popup removed"
 }
 
 # -----------------------------------------------------------------------------
@@ -261,22 +380,23 @@ EOF
 TOOLS=(ethtool iperf3 lldpd nfs-common jq htop tmux curl vim-nox)
 KERNEL_BEFORE=""
 upgrade_and_tools() {
-  hdr "Packages"
+  stage "Packages"
   KERNEL_BEFORE="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1 || true)"
-  info "apt-get update"
-  apt-get update -q >/dev/null || die "apt-get update failed (check repos above)."
-  if confirm "Run dist-upgrade now?" y; then
-    info "apt-get dist-upgrade (this takes a while)"
-    DEBIAN_FRONTEND=noninteractive apt-get -y -q \
-      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade >/dev/null \
+  spin "Refreshing package lists" apt-get update -q || die "apt-get update failed (check repos above)."
+  local upgr; upgr="$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst ' || true)"
+  info "${upgr} package(s) can be upgraded"
+  if (( upgr > 0 )) && confirm "Run dist-upgrade now?" y; then
+    spin "Upgrading ${upgr} packages" env DEBIAN_FRONTEND=noninteractive apt-get -y -q \
+      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade \
       || die "dist-upgrade failed."
-    ok "System upgraded"
+    summ ok "Packages" "upgraded ${upgr} packages, now PVE $(pveversion | grep -oE 'pve-manager/[0-9.]+' | cut -d/ -f2)"
+  else
+    summ skip "Packages" "no upgrade run"
   fi
-  info "Installing tools: ${TOOLS[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get -y -q install "${TOOLS[@]}" >/dev/null \
+  spin "Installing tools (${TOOLS[*]})" env DEBIAN_FRONTEND=noninteractive apt-get -y -q install "${TOOLS[@]}" \
     || warn "Some tools failed to install."
   systemctl enable -q --now lldpd 2>/dev/null || true
-  ok "Tools installed (lldpd lets 'lldpctl' show which switch port each NIC is on)"
+  info "lldpd is on: 'lldpctl' shows which switch port each NIC is plugged into"
 }
 
 kernel_changed() {
@@ -287,7 +407,7 @@ kernel_changed() {
 # 4. HA services
 # -----------------------------------------------------------------------------
 setup_ha() {
-  hdr "HA services"
+  stage "HA services"
   if (( CLUSTERED )); then
     ok "Host is in a cluster; leaving HA services alone"
     return
@@ -296,6 +416,7 @@ setup_ha() {
     if confirm "Standalone host. Disable pve-ha-lrm/crm? (say no if it will join a cluster)" n; then
       systemctl disable -q --now pve-ha-lrm pve-ha-crm
       ok "HA services disabled (re-enable: systemctl enable --now pve-ha-lrm pve-ha-crm)"
+      summ ok "HA" "lrm/crm disabled (standalone)"
     fi
   else
     ok "HA services already inactive"
@@ -419,17 +540,17 @@ current_hs_nics() { # NICs currently carrying vmbr1 (direct or via bond)
 in_list() { local x="$1"; shift; local y; for y in "$@"; do [[ $x == "$y" ]] && return 0; done; return 1; }
 
 print_nic_table() {
-  local n role
-  printf '\n  %-14s %-6s %-6s %-5s %-10s %-13s %-18s %s\n' NIC LINK SPEED MAX DRIVER "PCI CARD" MAC "LLDP (switch port)"
+  local n role link
+  printf '\n    %s%-14s %-6s %-6s %-5s %-10s %-13s %-18s %s%s\n' "$C_D" NIC LINK SPEED MAX DRIVER "PCI CARD" MAC "LLDP (switch port)" "$C_0"
   for n in "${NICS[@]}"; do
     role=""
-    in_list "$n" "${MGMT_NICS[@]}" && role=" <- vmbr0"
-    (( NIC_USB[$n] )) && role=" (USB/BMC, ignored)"
-    (( NIC_PROBED[$n] && NIC_LINK[$n] )) && role+=" (idle, cabled)"
-    printf '  %-14s %-6s %-6s %-5s %-10s %-13s %-18s %s%s\n' "$n" \
-      "$( (( NIC_LINK[$n] )) && echo up || echo down)" \
+    in_list "$n" "${MGMT_NICS[@]}" && role=" ${C_B}<- vmbr0${C_0}"
+    (( NIC_USB[$n] )) && role=" ${C_D}(USB/BMC, ignored)${C_0}"
+    (( NIC_PROBED[$n] && NIC_LINK[$n] )) && role+=" ${C_G}(idle, cabled)${C_0}"
+    if (( NIC_LINK[$n] )); then link="${C_G}$(printf '%-6s' up)${C_0}"; else link="${C_D}$(printf '%-6s' down)${C_0}"; fi
+    printf '    %s%-14s%s %s %-6s %-5s %s%-10s %-13s %-18s%s %s%s\n' "$C_BOLD" "$n" "$C_0" "$link" \
       "$(speed_h "${NIC_CUR[$n]}")" "$(speed_h "${NIC_MAX[$n]}")" \
-      "${NIC_DRV[$n]}" "${NIC_CARD[$n]}" "${NIC_MAC[$n]}" "${NIC_LLDP[$n]:--}" "$role"
+      "$C_D" "${NIC_DRV[$n]}" "${NIC_CARD[$n]}" "${NIC_MAC[$n]}" "$C_0" "${NIC_LLDP[$n]:--}" "$role"
   done
   echo
 }
@@ -543,7 +664,7 @@ build_interfaces() {
 cancel_rollback() { systemctl stop "${ROLLBACK_UNIT}.timer" 2>/dev/null || true; systemctl reset-failed "${ROLLBACK_UNIT}" 2>/dev/null || true; }
 
 setup_network() {
-  hdr "Network"
+  stage "Network"
   command -v ifreload >/dev/null || die "ifupdown2 (ifreload) not installed."
   discover_nics
   detect_mgmt_nics
@@ -643,15 +764,17 @@ setup_network() {
   hdr "Planned change to ${IFACES}"
   if diff -u "$IFACES" "$new" >/dev/null; then
     ok "Config already matches. Nothing to do."
+    summ ok "Network" "already configured (vmbr1 ${VMBR1_ADDR})"
     rm -f "$new"
     verify_network
     return 0
   fi
-  diff -u --label current --label new "$IFACES" "$new" || true
+  diff -u --label current --label new "$IFACES" "$new" | colordiff || true
   echo
 
   if (( DRY_RUN )); then
     info "Dry run: candidate file left at $new (nothing applied)."
+    summ skip "Network" "planned: vmbr1 ${VMBR1_ADDR} on ${HS_BOND}(${HS_NICS}) mtu ${HS_MTU}"
     return 0
   fi
   confirm "Apply this network config?" n || { info "Not applied. Candidate at $new"; return 0; }
@@ -696,6 +819,7 @@ setup_network() {
   if [[ $ans == keep ]]; then
     cancel_rollback
     ok "Network config kept. Backup: $bk"
+    summ ok "Network" "vmbr1 ${VMBR1_ADDR} on ${HS_BOND}(${HS_NICS}) mtu ${HS_MTU}"
   else
     warn "Rolling back."
     systemctl start "${ROLLBACK_UNIT}.service" || true
@@ -990,7 +1114,7 @@ cluster_join_exec() {
 
   (( rc )) && { CL_PW=""; die "Join checks failed; fix the items above and rerun with --cluster-only."; }
   info "Plan: join '${CL_NAME}' via ${CL_PEER}, link0=${l0}${l1:+, link1=${l1}}"
-  if (( DRY_RUN )); then CL_PW=""; ok "Dry run: join checks passed. Nothing changed."; return 0; fi
+  if (( DRY_RUN )); then CL_PW=""; ok "Dry run: join checks passed. Nothing changed."; summ skip "Cluster" "would join '${CL_NAME}' via ${CL_PEER}"; return 0; fi
   confirm "Join this node to cluster '${CL_NAME}' now?" n || { CL_PW=""; return 0; }
 
   # same API call the GUI's Join button makes
@@ -1017,6 +1141,7 @@ cluster_join_exec() {
   wait_quorate || die "Joined, but not quorate after 2 min. Check: pvecm status / journalctl -u corosync"
   CLUSTERED=1
   ok "Joined cluster '${CL_NAME}'"
+  summ ok "Cluster" "joined '${CL_NAME}' via ${CL_PEER} (link0 ${l0}${l1:+, link1 ${l1}})"
   show_cluster_health
 }
 
@@ -1046,15 +1171,16 @@ cluster_create_exec() {
   wait_quorate || die "Cluster created but not quorate after 2 min. Check: pvecm status"
   CLUSTERED=1
   ok "Cluster '${CL_NAME}' created"
+  summ ok "Cluster" "created '${CL_NAME}' (link0 ${l0}${l1:+, link1 ${l1}})"
   show_cluster_health
 }
 
 cluster_plan() {
-  hdr "Cluster plan"
-  if (( CLUSTERED )); then CL_ACTION=member; ok "Already a cluster member"; return 0; fi
+  stage "Cluster plan"
+  if (( CLUSTERED )); then CL_ACTION=member; ok "Already a cluster member"; summ ok "Cluster" "already a member"; return 0; fi
   CL_ACTION="${CLUSTER_ACTION:-$(ask "Cluster: skip, join an existing cluster, or create a new one? (skip/join/create)" "skip")}"
   case "$CL_ACTION" in
-    skip|"") CL_ACTION=skip; ok "Staying standalone" ;;
+    skip|"") CL_ACTION=skip; ok "Staying standalone"; summ skip "Cluster" "standalone" ;;
     join)   cluster_join_plan ;;
     create) cluster_create_plan ;;
     *) die "Cluster action must be skip, join or create." ;;
@@ -1062,7 +1188,7 @@ cluster_plan() {
 }
 
 cluster_exec() {
-  hdr "Cluster"
+  stage "Cluster"
   case "$CL_ACTION" in
     member) show_cluster_health ;;
     join)   cluster_join_exec ;;
@@ -1075,9 +1201,10 @@ cluster_exec() {
 # 7. NFS storage
 # -----------------------------------------------------------------------------
 setup_storage() {
-  hdr "NFS storage"
+  stage "NFS storage"
   if [[ $CL_ACTION == join || $CL_ACTION == member ]]; then
     ok "Cluster member: storage comes from the cluster's storage.cfg"
+    summ ok "Storage" "inherited from cluster: $(pvesm status 2>/dev/null | awk 'NR>1{printf "%s ", $1}')"
     pvesm status 2>/dev/null | sed 's/^/  /' || true
     return 0
   fi
@@ -1106,6 +1233,7 @@ setup_storage() {
   sleep 2
   pvesm status | awk -v id="$id" 'NR==1 || $1==id'
   ok "Storage $id added"
+  summ ok "Storage" "${id} -> ${server}:${nfs_export}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1131,9 +1259,12 @@ main() {
     shift
   done
 
-  printf '%spve-bootstrap %s%s\n' "$C_BOLD" "$VERSION" "$C_0"
+  trap '(( IS_TTY )) && printf "\e[?25h"' EXIT
+  local t_start=$SECONDS
+  banner
   preflight
   mkdir -p "$BACKUP_DIR"
+  STAGE_TOTAL=$(( DO_CLUSTER * 2 + DO_REPOS + DO_NAG + DO_UPGRADE + DO_NETWORK + DO_HA + DO_STORAGE ))
 
   (( DO_CLUSTER )) && cluster_plan    # first: learn the peer before touching anything
   (( DO_REPOS ))   && setup_repos
@@ -1144,9 +1275,10 @@ main() {
   (( DO_HA ))      && setup_ha        # after cluster: never offered on members
   (( DO_STORAGE )) && setup_storage   # after join: cluster storage is inherited
 
-  hdr "Done"
-  if (( DRY_RUN )); then ok "Dry run complete; nothing was changed."; rmdir "$BACKUP_DIR" 2>/dev/null || true
-  else ok "Backups of everything changed: ${BACKUP_DIR}"; fi
+  local foot
+  if (( DRY_RUN )); then foot="dry run complete in $(dur $((SECONDS - t_start))); nothing was changed"; rmdir "$BACKUP_DIR" 2>/dev/null || true
+  else foot="done in $(dur $((SECONDS - t_start)))  ${S_INFO} backups: ${BACKUP_DIR}  ${S_INFO} log: ${LOG}"; fi
+  print_summary "$foot"
   if (( DO_UPGRADE )) && kernel_changed; then
     warn "A new kernel was installed."
     confirm "Reboot now?" n && { info "Rebooting"; systemctl reboot; }
