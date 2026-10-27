@@ -48,7 +48,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -377,23 +377,51 @@ EOF
 # -----------------------------------------------------------------------------
 # 3. packages
 # -----------------------------------------------------------------------------
+# Other things grab the dpkg lock too: pve-daily-update at boot, or tools that
+# SSH in right after a cluster join to install their own packages.
+APT_WAIT="-o DPkg::Lock::Timeout=600"
+
+apt_busy() { pgrep -a -x 'apt|apt-get|dpkg|unattended-upgr' 2>/dev/null | head -1 || true; }
+
+wait_for_apt() { # wait up to $1 seconds for any apt/dpkg to finish
+  local max="${1:-600}" t0=$SECONDS who i=0
+  who="$(apt_busy)"
+  [[ -z $who ]] && return 0
+  warn "Another package job is running: ${who#* }"
+  while [[ -n "$(apt_busy)" ]] && (( SECONDS - t0 < max )); do
+    if (( IS_TTY )); then
+      printf '\r  %s%s%s waiting for it to finish %s%ds%s ' "$C_B" "${SPIN[i++ % ${#SPIN[@]}]}" "$C_0" "$C_D" $((SECONDS - t0)) "$C_0"
+    fi
+    sleep 1
+  done
+  (( IS_TTY )) && printf '\r\e[K'
+  if [[ -n "$(apt_busy)" ]]; then warn "Still running after $(dur $max)."; return 1; fi
+  ok "Package job finished ($(dur $((SECONDS - t0))))"
+}
+
+safe_reboot() {
+  wait_for_apt 900 || { warn "Not rebooting while packages are being installed. Reboot by hand when it finishes."; return 0; }
+  info "Rebooting"
+  systemctl reboot || warn "systemd refused the reboot (see 'systemd-inhibit --list'); reboot by hand when clear."
+}
+
 TOOLS=(ethtool iperf3 lldpd nfs-common jq htop tmux curl vim-nox)
 KERNEL_BEFORE=""
 upgrade_and_tools() {
   stage "Packages"
   KERNEL_BEFORE="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1 || true)"
-  spin "Refreshing package lists" apt-get update -q || die "apt-get update failed (check repos above)."
+  spin "Refreshing package lists" apt-get $APT_WAIT update -q || die "apt-get update failed (check repos above)."
   local upgr; upgr="$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst ' || true)"
   info "${upgr} package(s) can be upgraded"
   if (( upgr > 0 )) && confirm "Run dist-upgrade now?" y; then
-    spin "Upgrading ${upgr} packages" env DEBIAN_FRONTEND=noninteractive apt-get -y -q \
+    spin "Upgrading ${upgr} packages" env DEBIAN_FRONTEND=noninteractive apt-get $APT_WAIT -y -q \
       -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade \
       || die "dist-upgrade failed."
     summ ok "Packages" "upgraded ${upgr} packages, now PVE $(pveversion | grep -oE 'pve-manager/[0-9.]+' | cut -d/ -f2)"
   else
     summ skip "Packages" "no upgrade run"
   fi
-  spin "Installing tools (${TOOLS[*]})" env DEBIAN_FRONTEND=noninteractive apt-get -y -q install "${TOOLS[@]}" \
+  spin "Installing tools (${TOOLS[*]})" env DEBIAN_FRONTEND=noninteractive apt-get $APT_WAIT -y -q install "${TOOLS[@]}" \
     || warn "Some tools failed to install."
   systemctl enable -q --now lldpd 2>/dev/null || true
   info "lldpd is on: 'lldpctl' shows which switch port each NIC is plugged into"
@@ -1281,7 +1309,7 @@ main() {
   print_summary "$foot"
   if (( DO_UPGRADE )) && kernel_changed; then
     warn "A new kernel was installed."
-    confirm "Reboot now?" n && { info "Rebooting"; systemctl reboot; }
+    if confirm "Reboot now?" n; then safe_reboot; fi
   fi
 }
 
