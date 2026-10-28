@@ -35,8 +35,8 @@
 #                   check against the peer. Changes nothing.
 #   --network-only  Run only the network stage.
 #   --cluster-only  Run only the cluster stage.
-#   --vastnfs       Retrofit an existing node: install vastnfs, offer split
-#                   mode on the storage NICs, then reboot (or remount if it is
+#   --vastnfs       Retrofit an existing node: install vastnfs, re-check the
+#                   storage network (HS_MODE=split to use both NICs), then reboot (or remount if it is
 #                   already loaded). Skips repos, upgrade, cluster, storage.
 #                   Migrate VMs off first; it warns if any are running.
 #   -y              Accept defaults for every prompt (non-interactive).
@@ -46,9 +46,11 @@
 #   HS_BOND=bond0         bond name
 #   HS_MODE=auto          vmbr1 mode (auto | active-backup | 802.3ad | split);
 #                         auto = 802.3ad if LLDP shows the switch ports are
-#                         LAG members; else split when vastnfs is on and there
-#                         are 2 NICs (both used via localports, no switch
-#                         config); else active-backup
+#                         LAG members, else active-backup. split is opt-in
+#                         only: vmbr1 gets one NIC (no failover for VM
+#                         traffic on vmbr1), the 2nd NIC is host-only storage
+#                         via vastnfs localports. Use it only when no VMs
+#                         attach to vmbr1.
 #   HS_NIC2_ADDR=         split mode: address/CIDR for the 2nd storage NIC
 #                         (default: vmbr1 address with 3rd octet + 1)
 #   VASTNFS=yes|no        install the VAST NFS client (default: ask)
@@ -76,7 +78,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.6.1"
+VERSION="1.7.0"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -894,8 +896,9 @@ setup_vastnfs() {
     yes|y|1|true) WANT_VASTNFS=1 ;;
     no|n|0|false) WANT_VASTNFS=0 ;;
     *)
-      info "vastnfs gives multipath to VAST: every mount spreads over all VIPs, and with two"
-      info "storage NICs uses both without LACP (tested ~2x read throughput, survives losing a link)."
+      info "vastnfs gives multipath to VAST: every mount spreads over all VIPs. Its big win (both"
+      info "NICs without LACP, ~2x) needs split mode, which drops failover for VMs on vmbr1."
+      info "With a bond, stock NFS + DNS prefixes already spreads well; vastnfs adds little."
       info "Cost: a DKMS kernel module. A guard keeps kernel updates from ever booting without it."
       if confirm "Install the VAST NFS client?" "$def"; then WANT_VASTNFS=1; else WANT_VASTNFS=0; fi
       ;;
@@ -1035,8 +1038,6 @@ recommend_bond_mode() {
     else
       printf '802.3ad|switch ports are LAG members on %s\n' "${sws[0]}"
     fi
-  elif [[ ${WANT_VASTNFS:-0} == 1 ]]; then
-    printf 'split|vastnfs localports uses both NICs with no switch config and survives losing either; VM traffic on vmbr1 uses only the first NIC\n'
   elif (( ${#nolldp[@]} )); then
     printf 'active-backup|no LLDP from the switch on %s; cannot tell if the ports are bonded\n' "${nolldp[*]}"
   else
@@ -1413,6 +1414,9 @@ setup_network() {
     split)
       (( ${#hs[@]} == 2 )) || die "split mode needs exactly 2 NICs."
       [[ ${WANT_VASTNFS:-0} == 1 ]] || die "split mode only pays off with vastnfs (localports). Enable vastnfs or pick a bond mode."
+      warn "split: vmbr1 runs on ${hs[0]} ONLY. VMs attached to vmbr1 lose that network if ${hs[0]}"
+      warn "or its switch fails (host storage survives over ${hs[1]}). Use only if no VMs use vmbr1."
+      confirm "Use split mode anyway?" n || die "Aborted. Re-run with HS_MODE=active-backup."
       ;;
     *) die "Mode must be active-backup, 802.3ad or split." ;;
   esac
@@ -1527,8 +1531,11 @@ net.ipv4.conf.default.rp_filter = 2
 EOF
     sysctl -q --system
     ok "multihoming sysctls set (${SPLIT_SYSCTL})"
-  elif [[ -f $SPLIT_SYSCTL ]]; then
-    rm -f "$SPLIT_SYSCTL"; sysctl -q --system
+  else
+    # leaving split: drop its multihoming sysctls and source-routing rules
+    if [[ -f $SPLIT_SYSCTL ]]; then rm -f "$SPLIT_SYSCTL"; sysctl -q --system; fi
+    ip rule del priority 101 2>/dev/null || true
+    ip rule del priority 102 2>/dev/null || true
   fi
   # an existing bond under vmbr1 must release its NICs before re-plumbing
   local ob
