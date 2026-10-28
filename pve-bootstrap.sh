@@ -76,7 +76,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -253,9 +253,13 @@ colordiff() { # colorize unified diff on stdin
 }
 
 # All prompts read from /dev/tty so this works under `bash -c "$(curl ...)"`.
+# drop keystrokes typed ahead (e.g. while a check was running) so they can't
+# leak into the next answer
+flush_tty() { local _junk; while read -r -s -t 0.05 -n 256 _junk </dev/tty 2>/dev/null; do :; done; return 0; }
 ask() { # ask "Prompt" "default" -> echoes answer
   local prompt="$1" def="${2-}" ans
   if (( ASSUME_YES )); then printf '%s\n' "$def"; return; fi
+  flush_tty
   read -r -p "  ${C_B}${S_Q}${C_0} ${prompt} ${C_D}[${def}]${C_0} " ans </dev/tty || true
   printf '%s\n' "${ans:-$def}"
 }
@@ -263,6 +267,7 @@ confirm() { # confirm "Prompt" y|n
   local prompt="$1" def="${2:-n}" ans hint
   [[ $def == y ]] && hint="Y/n" || hint="y/N"
   if (( ASSUME_YES )); then [[ $def == y ]]; return; fi
+  flush_tty
   read -r -p "  ${C_B}${S_Q}${C_0} ${prompt} ${C_D}(${hint})${C_0} " ans </dev/tty || true
   ans="${ans:-$def}"
   [[ ${ans,,} == y || ${ans,,} == yes ]]
@@ -1550,14 +1555,16 @@ EOF
   if (( ASSUME_YES )); then
     ans=keep
   else
+    flush_tty
     read -r -t "$((ROLLBACK_SECS - 20))" -p "Type 'keep' to keep this config (anything else or timeout = roll back): " ans </dev/tty || true
+    ans="$(tr -d '[:space:]' <<<"$ans")"
   fi
-  if [[ $ans == keep ]]; then
+  if [[ ${ans,,} == keep ]]; then
     cancel_rollback
     ok "Network config kept. Backup: $bk"
     summ ok "Network" "$(net_summary)"
   else
-    warn "Rolling back."
+    warn "Rolling back (got '${ans}', not 'keep')."
     systemctl start "${ROLLBACK_UNIT}.service" || true
     die "Network rolled back to $bk"
   fi
@@ -1616,7 +1623,8 @@ verify_network() {
     ok "split: vmbr1 on ${bp}, 2nd storage NIC ${n2} $(ip -4 -o addr show dev "$n2" | awk '{print $4}')"
     ip rule | gq -E '^10[12]:' && ok "policy routing rules 101/102 present" || { err "policy routing rules missing"; rc=1; }
   fi
-  for i in $(cat "/sys/class/net/$b/bonding/slaves" 2>/dev/null) "$b" vmbr1 $n2; do
+  local bslaves=""; [[ -n $b && -r /sys/class/net/$b/bonding/slaves ]] && bslaves="$(cat "/sys/class/net/$b/bonding/slaves")"
+  for i in $bslaves "$b" vmbr1 $n2; do
     [[ -n $i && -e /sys/class/net/$i ]] || continue
     local m; m="$(cat "/sys/class/net/$i/mtu")"
     line+="$i=$m "
