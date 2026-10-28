@@ -27,7 +27,7 @@
 #
 # Usage:
 #   bash -c "$(curl -fsSL <raw-url>/pve-bootstrap.sh)"
-#   ./pve-bootstrap.sh [--dry-run] [--network-only] [--cluster-only]
+#   ./pve-bootstrap.sh [--dry-run] [--network-only] [--cluster-only] [--vastnfs]
 #                      [--skip-repos] [--skip-upgrade] [--skip-network]
 #                      [--skip-cluster] [--skip-storage] [--skip-vastnfs] [-y]
 #
@@ -35,6 +35,10 @@
 #                   check against the peer. Changes nothing.
 #   --network-only  Run only the network stage.
 #   --cluster-only  Run only the cluster stage.
+#   --vastnfs       Retrofit an existing node: install vastnfs, offer split
+#                   mode on the storage NICs, then reboot (or remount if it is
+#                   already loaded). Skips repos, upgrade, cluster, storage.
+#                   Migrate VMs off first; it warns if any are running.
 #   -y              Accept defaults for every prompt (non-interactive).
 #
 # Environment overrides (handy for -y / Ansible):
@@ -72,7 +76,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -113,6 +117,7 @@ SPLIT_SYSCTL="/etc/sysctl.d/90-vast-multihome.conf"
 
 ASSUME_YES=0
 DRY_RUN=0
+RETROFIT=0
 DO_REPOS=1 DO_NAG=1 DO_UPGRADE=1 DO_HA=1 DO_NETWORK=1 DO_CLUSTER=1 DO_STORAGE=1 DO_VASTNFS=1
 
 # -----------------------------------------------------------------------------
@@ -914,6 +919,45 @@ setup_vastnfs() {
     ok "vastnfs installed; it loads on the next boot (the sync unit applies mount options then)"
     summ ok "vastnfs" "installed, guard + boot sync on; REBOOT to load"
   fi
+}
+
+# --vastnfs retrofit: an existing node only needs the tools the network stage
+# relies on (lldpd for the bond/split recommendation) and a check that nothing
+# is running here, since vmbr1 is re-plumbed and the node reboots at the end.
+running_guests() { # "vm:101 ct:200 ..." for guests running on this node
+  { qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print "vm:"$1}'
+    pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print "ct:"$1}'; } | tr '\n' ' ' | sed 's/ $//'
+}
+
+retrofit_prep() {
+  stage "Retrofit checks"
+  local missing=() t
+  for t in "${TOOLS[@]}"; do dpkg -s "$t" >/dev/null 2>&1 || missing+=("$t"); done
+  if (( ${#missing[@]} )); then
+    if (( DRY_RUN )); then
+      info "Dry run: would install ${missing[*]}"
+    elif ! spin "Installing ${missing[*]}" env DEBIAN_FRONTEND=noninteractive apt-get $APT_WAIT -y -q install "${missing[@]}"; then
+      spin "Refreshing package lists" apt-get $APT_WAIT update -q || true
+      spin "Installing ${missing[*]}" env DEBIAN_FRONTEND=noninteractive apt-get $APT_WAIT -y -q install "${missing[@]}" \
+        || warn "Could not install ${missing[*]}."
+    fi
+  else
+    ok "Tools present (${TOOLS[*]})"
+  fi
+  (( DRY_RUN )) || systemctl enable -q --now lldpd 2>/dev/null || true
+
+  local g; g="$(running_guests)"
+  if [[ -n $g ]]; then
+    warn "Guests running on this node: ${g}"
+    warn "The storage network is re-plumbed and the node reboots. Migrate them off first."
+    (( DRY_RUN )) || confirm "Continue anyway?" n || die "Aborted. Migrate the guests and re-run."
+  else
+    ok "No guests running on this node"
+  fi
+  if dkms status -m vastnfs 2>/dev/null | gq ': installed'; then
+    info "vastnfs is already installed; this run refreshes hooks and re-checks the network."
+  fi
+  summ ok "Retrofit" "tools ok, guests: ${g:-none}"
 }
 
 # -----------------------------------------------------------------------------
@@ -2115,7 +2159,7 @@ verify_storage_spread() {
 # -----------------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------------
-usage() { sed -n '2,45p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see header"; }
+usage() { awk 'NR > 2 && /^# =+$/ { exit } NR > 2' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see header"; }
 
 main() {
   while (( $# )); do
@@ -2130,6 +2174,8 @@ main() {
       --skip-cluster) DO_CLUSTER=0 ;;
       --skip-storage) DO_STORAGE=0 ;;
       --skip-vastnfs) DO_VASTNFS=0 ;;
+      --vastnfs) RETROFIT=1; DO_REPOS=0 DO_NAG=0 DO_UPGRADE=0 DO_HA=0 DO_CLUSTER=0 DO_STORAGE=0
+                 DO_VASTNFS=1 DO_NETWORK=1; VASTNFS="${VASTNFS:-yes}" ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
@@ -2141,8 +2187,9 @@ main() {
   banner
   preflight
   mkdir -p "$BACKUP_DIR"
-  STAGE_TOTAL=$(( DO_CLUSTER * 2 + DO_REPOS + DO_NAG + DO_UPGRADE + DO_VASTNFS + DO_NETWORK + DO_HA + DO_STORAGE ))
+  STAGE_TOTAL=$(( RETROFIT + DO_CLUSTER * 2 + DO_REPOS + DO_NAG + DO_UPGRADE + DO_VASTNFS + DO_NETWORK + DO_HA + DO_STORAGE ))
 
+  (( RETROFIT ))   && retrofit_prep   # --vastnfs on an existing node
   (( DO_CLUSTER )) && cluster_plan    # first: learn the peer before touching anything
   (( DO_REPOS ))   && setup_repos
   (( DO_NAG ))     && remove_nag
@@ -2157,6 +2204,10 @@ main() {
   if (( DRY_RUN )); then foot="dry run complete in $(dur $((SECONDS - t_start))); nothing was changed"; rmdir "$BACKUP_DIR" 2>/dev/null || true
   else foot="done in $(dur $((SECONDS - t_start)))  ${S_INFO} backups: ${BACKUP_DIR}  ${S_INFO} log: ${LOG}"; fi
   print_summary "$foot"
+  if (( RETROFIT && ! DRY_RUN && ! NEED_REBOOT )) && [[ -x $VASTNFS_HELPER ]]; then
+    info "vastnfs already loaded: applying mount options now (remounts VAST storages not in use)"
+    "$VASTNFS_HELPER" sync --remount || warn "sync failed; run: ${VASTNFS_HELPER} sync --remount"
+  fi
   if (( NEED_REBOOT )) || { (( DO_UPGRADE )) && kernel_changed; }; then
     (( NEED_REBOOT )) && warn "vastnfs needs a reboot to load (mount options are applied at boot)."
     (( DO_UPGRADE )) && kernel_changed && warn "A new kernel was installed."
