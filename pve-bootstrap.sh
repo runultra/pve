@@ -78,7 +78,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -835,7 +835,12 @@ cmd_status() {
 cmd_remove() {
   systemctl disable -q --now vastnfs-sync.service 2>/dev/null || true
   rm -f "$SYNC_UNIT"; systemctl daemon-reload
-  if [[ -f $NFSCONF ]]; then local t; t="$(mktemp)"; strip_block "$NFSCONF" | cat -s >"$t"; cat "$t" >"$NFSCONF"; rm -f "$t"; fi
+  if [[ -f $NFSCONF ]]; then
+    local t; t="$(mktemp)"; strip_block "$NFSCONF" | cat -s >"$t"
+    # nothing but whitespace left means we created the file: remove it
+    if grep -q '[^[:space:]]' "$t"; then cat "$t" >"$NFSCONF"; else rm -f "$NFSCONF"; fi
+    rm -f "$t"
+  fi
   rm -f "/etc/kernel/postinst.d/${GUARD_NAME}" "/etc/kernel/header_postinst.d/${GUARD_NAME}" "$GUARD_BIN" "$APT_HOOK" /etc/motd.d/vastnfs-guard
   [[ -f $GUARD_STATE/pinned ]] && proxmox-boot-tool kernel unpin >/dev/null 2>&1
   rm -rf "$GUARD_STATE"
