@@ -78,7 +78,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -1833,6 +1833,18 @@ cluster_join_plan() {
   local quorate
   quorate="$(pve_api_get "$CL_PEER" /cluster/status | json 'for (@{$d->{data} // []}) { print $_->{quorate} // 0 if $_->{type} eq "cluster" }')"
   [[ $quorate == 1 ]] && ok "Cluster is quorate" || { err "Cluster is NOT quorate; joins will fail."; rc=1; }
+
+  # Proxmox doesn't block a join while a QDevice is configured, but the result
+  # is unsupported (odd node count on a fifty-fifty-split QDevice, and the new
+  # node lacks the QDevice package and certificate). Remove it first.
+  local qd_host
+  qd_host="$(pve_api_get "$CL_PEER" /cluster/config/qdevice | json 'print $d->{data}{"QNetd host"} // ""')"
+  if [[ -n $qd_host ]]; then
+    err "Cluster '${CL_NAME}' has a QDevice (${qd_host}). Remove it before adding a node:"
+    err "  on ${CL_PEER}: pvecm qdevice remove"
+    err "Then rerun this. Re-add it afterwards only if the new node count is even."
+    rc=1
+  fi
 
   local me line n a f r0 r1 live_fp
   me="$(hostname)"

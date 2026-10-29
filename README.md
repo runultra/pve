@@ -102,9 +102,37 @@ If a reboot is needed (new kernel, or vastnfs), it asks at the very end.
 **Every additional node (joins the cluster, inherits storage)**
 
 ```bash
+# if the cluster has a QDevice (2-node clusters should), remove it first, on any member:
+pvecm qdevice remove
+# then on the new node:
 CLUSTER_ACTION=join CLUSTER_PEER=10.143.11.125 ./pve-bootstrap.sh
 #   prompts for the peer's root password; builds vmbr1 on the cluster's own subnet/MTU
 ```
+
+Proxmox itself does not block a join while a QDevice is configured, but the result is unsupported. pve-bootstrap's join preflight checks for one and stops before changing anything.
+
+**QDevice (2-node clusters)**
+
+Two nodes alone lose quorum when either goes down. A QDevice is a third vote from a small VM or box outside the cluster (`corosync-qnetd`).
+
+```bash
+# on the QDevice host (Debian/Ubuntu): apt install -y corosync-qnetd
+#   root must accept the cluster nodes' SSH keys (cat /etc/pve/priv/authorized_keys from a node
+#   into its /root/.ssh/authorized_keys) and sshd needs PermitRootLogin prohibit-password
+# on every PVE node:
+apt install -y corosync-qdevice
+# on one PVE node:
+pvecm qdevice setup <qdevice-ip>
+pvecm status        # Expected votes 3, Total votes 3, Flags: Quorate Qdevice
+```
+
+| Node count | QDevice |
+|---|---|
+| 2 | Yes |
+| 3, 5, 7, 9 (odd) | No. Proxmox recommends against it |
+| 4, 6, 8, 10 (even) | Optional tiebreaker |
+
+Adding or removing a node always means `pvecm qdevice remove` first, then `pvecm qdevice setup` again afterwards if the new count is even.
 
 **Check a node without changing anything**
 
