@@ -159,6 +159,18 @@ Pick by what the switch side supports:
 
 **How the rollback works.** Before applying, the script backs up `/etc/network/interfaces` and arms a systemd timer (`ROLLBACK_SECS`, default 180 s) that restores it. After `ifreload` it runs its checks, then asks you to type `keep`. Anything else, or no answer, restores the old config. If the checks fail you're asked whether to keep it anyway (default no). The management bridge `vmbr0` is only touched if you change its address, which it refuses on a clustered node.
 
+**Active-backup never fails back on its own.** Bonds are written with `bond-primary <first NIC>` and `bond-primary-reselect failure`: the first NIC is preferred at boot, but once traffic moves to the second NIC it stays there until that NIC fails. A link coming back up is not proof the path works (a replacement switch can have link before its VLAN/MTU config is done), so the bond doesn't jump back onto it.
+
+**Rotating the storage switch pair, one switch at a time** (active-backup):
+
+1. Check every node: `grep -E "Currently Active|Primary Reselect" /proc/net/bonding/bond0`.
+2. Before pulling the switch that carries the **active** NIC, move each node off it: `echo nic6 > /sys/class/net/bond0/bonding/active_slave` (no traffic loss). Pulling the standby side needs no prep.
+3. Swap the switch. Before cabling hosts back, confirm the new switch: VLAN, MTU 9000, uplinks/peerlink.
+4. Verify the path from a node: `ip link show nic4` shows UP, then move one node back with `echo nic4 > /sys/class/net/bond0/bonding/active_slave` and run `ping -M do -s 8972 <vip>`. Then the rest.
+5. Repeat for the other switch.
+
+VM disks (host NFS) and every VM's `vmbr1` network ride through all of this; hard NFS mounts pause I/O for the failover instead of erroring.
+
 **Split mode details** (only if you chose it): vmbr1 bridges the first NIC; the second NIC gets its own IP in the same subnet (default: vmbr1's address with the third octet + 1, e.g. `172.200.12.127`); per-IP routing tables 101/102 and `/etc/sysctl.d/90-vast-multihome.conf` (`arp_ignore=1`, `arp_announce=2`, `rp_filter=2`) make each IP answer and send on its own NIC. Leaving split mode removes the rules and sysctls.
 
 ### Storage: the VAST layout

@@ -78,7 +78,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.7.1"
+VERSION="1.8.0"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -1330,7 +1330,10 @@ build_interfaces() {
     printf 'auto %s\niface %s inet manual\n' "$HS_BOND" "$HS_BOND"
     printf '\tbond-slaves %s\n\tbond-miimon 100\n\tbond-mode %s\n' "${hs[*]}" "$HS_MODE"
     if [[ $HS_MODE == active-backup ]]; then
-      printf '\tbond-primary %s\n' "${hs[0]}"
+      # primary-reselect failure: prefer hs[0] at bring-up, but never fail BACK to
+      # it on link-up alone. A replacement switch with link but no config yet
+      # would otherwise pull every node onto a dead path.
+      printf '\tbond-primary %s\n\tbond-primary-reselect failure\n' "${hs[0]}"
     else
       printf '\tbond-xmit-hash-policy layer3+4\n\tbond-lacp-rate fast\n'
     fi
