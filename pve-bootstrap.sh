@@ -78,7 +78,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -456,7 +456,7 @@ safe_reboot() {
   systemctl reboot || warn "systemd refused the reboot (see 'systemd-inhibit --list'); reboot by hand when clear."
 }
 
-TOOLS=(ethtool iperf3 lldpd nfs-common jq htop tmux curl vim-nox)
+TOOLS=(ethtool iperf3 lldpd nfs-common jq htop tmux curl vim-nox libguestfs-tools libhivex-bin)
 KERNEL_BEFORE=""
 upgrade_and_tools() {
   stage "Packages"
