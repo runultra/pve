@@ -67,6 +67,10 @@
 #   CLUSTER_PASSWORD=...           root@pam password of the peer (else prompted)
 #   CLUSTER_NAME=poc-var           name when creating
 #   CLUSTER_LINK0 / CLUSTER_LINK1  corosync addresses (default vmbr0 / vmbr1 IPs)
+#   MIGRATION_NET=vmbr1|vmbr0|<CIDR>|skip   network live migrations use
+#                                  (cluster-wide; default vmbr1's subnet)
+#   MIGRATION_TYPE=secure|insecure secure = SSH tunnel; insecure = plain TCP,
+#                                  much faster, only on an isolated network
 #   STORAGE_LAYOUT=vast|single|skip
 #   VAST_POOL_FQDN=proxmox.selab-var201.selab.vastdata.com   VIP pool FQDN
 #   VAST_EXPORT_BASE=/proxmox/datastores/<cluster>           parent of the views
@@ -78,7 +82,7 @@
 set -Eeuo pipefail
 trap 'printf "\n[xx] unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="1.8.2"
+VERSION="1.9.0"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/pve-bootstrap-backup/${TS}"
 IFACES="/etc/network/interfaces"
@@ -102,6 +106,8 @@ CLUSTER_PASSWORD="${CLUSTER_PASSWORD:-}"
 CLUSTER_NAME="${CLUSTER_NAME:-}"
 CLUSTER_LINK0="${CLUSTER_LINK0:-}"
 CLUSTER_LINK1="${CLUSTER_LINK1:-}"
+MIGRATION_NET="${MIGRATION_NET:-}"
+MIGRATION_TYPE="${MIGRATION_TYPE:-}"
 STORAGE_LAYOUT="${STORAGE_LAYOUT:-}"
 VAST_POOL_FQDN="${VAST_POOL_FQDN:-}"
 VAST_EXPORT_BASE="${VAST_EXPORT_BASE:-}"
@@ -1988,6 +1994,95 @@ cluster_create_exec() {
   show_cluster_health
 }
 
+# --- live migration network (datacenter.cfg "migration:", cluster-wide) ------
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+ip_in_cidr() { # ip_in_cidr <ip> <net/len>
+  local ip="$1" net="${2%/*}" len="${2#*/}" mask
+  (( len == 0 )) && return 0
+  mask=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  (( ($(ip2int "$ip") & mask) == ($(ip2int "$net") & mask) ))
+}
+iface_subnet() { # connected subnet of a bridge, e.g. vmbr1 -> 172.200.0.0/16
+  ip -4 -o route show dev "$1" proto kernel scope link 2>/dev/null | awk '{print $1}' | head -1 || true
+}
+migration_current() { # prints "type|network" from the cluster config
+  pvesh get /cluster/options --output-format json 2>/dev/null | json '
+    my $m = $d->{migration} // ""; my %h;
+    if (ref $m eq "HASH") { %h = %$m } else { for (split /,/, $m) { my ($k,$v) = split /=/, $_, 2; $h{$k} = $v } }
+    print(($h{type} // "") . "|" . ($h{network} // ""))' || true
+}
+migration_node_ips() { # node|ip-in-net lines for every member (empty ip = missing)
+  local net="$1" n ips ip hit
+  for n in $(pvesh get /nodes --output-format json 2>/dev/null | json 'print "$_->{node}\n" for @{$d // []}'); do
+    ips="$(pvesh get "/nodes/${n}/network" --output-format json 2>/dev/null \
+      | json 'for (@{$d // []}) { print "$1\n" if ($_->{cidr} // "") =~ m{^([\d.]+)/} }' || true)"
+    hit=""
+    for ip in $ips; do ip_in_cidr "$ip" "$net" && { hit="$ip"; break; }; done
+    printf '%s|%s\n' "$n" "$hit"
+  done
+}
+
+cluster_migration() {
+  hdr "Live migration network"
+  local cur ctype cnet
+  cur="$(migration_current)"; ctype="${cur%%|*}"; cnet="${cur#*|}"
+  if [[ -n $cnet ]]; then info "Cluster setting: network=${cnet} type=${ctype:-secure}"
+  else info "Cluster setting: not set (migrations use the mgmt network over SSH)"; fi
+
+  # offer every bridge that has an IPv4 subnet
+  local b sub opts=() def=""
+  for b in /sys/class/net/vmbr*; do
+    b="${b##*/}"; [[ $b =~ ^vmbr[0-9]+$ ]] || continue
+    sub="$(iface_subnet "$b")"; [[ -n $sub ]] || continue
+    opts+=("$b=$sub")
+    printf '    %s%-6s%s %s\n' "$C_BOLD" "$b" "$C_0" "$sub"
+  done
+  for b in "${opts[@]}"; do [[ $b == vmbr1=* ]] && def="vmbr1"; done
+  [[ -z $def && -n $cnet ]] && def="$cnet"
+  [[ -z $def ]] && def="vmbr0"
+  [[ -n $cnet ]] && def="keep"
+
+  local pick net
+  pick="${MIGRATION_NET:-$(ask "Migration network: bridge name, CIDR, 'keep' or 'skip'" "$def")}"
+  case "$pick" in
+    skip) summ skip "Migration" "left as is"; return 0 ;;
+    keep) [[ -n $cnet ]] || { warn "Nothing to keep; leaving migrations on the default."; return 0; }; net="$cnet" ;;
+    vmbr*) net="$(iface_subnet "$pick")"; [[ -n $net ]] || die "$pick has no IPv4 subnet on this node." ;;
+    *) valid_cidr "$pick" || die "Not a bridge or CIDR: $pick"; net="$pick" ;;
+  esac
+
+  local typ
+  typ="${MIGRATION_TYPE:-$(ask "Migration type: secure (SSH tunnel) or insecure (plain TCP, faster; isolated nets only)" "${ctype:-secure}")}"
+  [[ $typ == secure || $typ == insecure ]] || die "Migration type must be secure or insecure."
+
+  # every member needs an address in that network or migrations to/from it fail
+  local n ip gaps=0
+  while IFS='|' read -r n ip; do
+    [[ -n $n ]] || continue
+    if [[ -n $ip ]]; then ok "${n}: ${ip}"
+    else err "${n}: no address in ${net} (migrations to/from it will fail)"; gaps=1; fi
+  done < <(migration_node_ips "$net")
+  if ! local_has_ip_in "$net"; then
+    if (( DRY_RUN )); then warn "this node has no address in ${net} yet (dry run)"
+    else err "this node has no address in ${net}"; gaps=1; fi
+  fi
+
+  if [[ $net == "$cnet" && $typ == "${ctype:-secure}" ]]; then
+    ok "Migration network already ${net} (${typ})"
+    if (( gaps )); then summ warn "Migration" "${net}, ${typ}; some nodes have no IP in it"
+    else summ ok "Migration" "${net}, ${typ}"; fi
+    return 0
+  fi
+  (( gaps )) && { confirm "Some nodes have no IP in ${net}. Set it anyway?" n || { summ warn "Migration" "not changed (nodes missing an IP in ${net})"; return 0; }; }
+  info "Plan: migration type=${typ},network=${net} (applies to the whole cluster)"
+  if (( DRY_RUN )); then summ skip "Migration" "would set ${net}, ${typ}"; return 0; fi
+  confirm "Set the cluster migration network to ${net} (${typ})?" y || { summ skip "Migration" "not changed"; return 0; }
+  pvesh set /cluster/options --migration "type=${typ},network=${net}" || die "Setting migration options failed."
+  ok "Migrations now use ${net} (${typ})"
+  summ ok "Migration" "${net}, ${typ}"
+}
+local_has_ip_in() { local ip; for ip in $(ip -4 -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do ip_in_cidr "$ip" "$1" && return 0; done; return 1; }
+
 cluster_plan() {
   stage "Cluster plan"
   if (( CLUSTERED )); then CL_ACTION=member; ok "Already a cluster member"; summ ok "Cluster" "already a member"; return 0; fi
@@ -2008,6 +2103,10 @@ cluster_exec() {
     create) cluster_create_exec ;;
     *)      ok "Standalone (no cluster changes)" ;;
   esac
+  # migration settings only make sense once we're in a cluster (or about to be, in a dry run)
+  if (( CLUSTERED )) || { (( DRY_RUN )) && [[ $CL_ACTION == join || $CL_ACTION == create ]]; }; then
+    cluster_migration
+  fi
 }
 
 # -----------------------------------------------------------------------------
